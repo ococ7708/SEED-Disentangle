@@ -51,19 +51,19 @@ DE [N,3,62,5] → CAST-e3 → h[128]
 $py = 'C:/Users/oc200/anaconda3/envs/sgda_py311/python.exe'
 
 # 0) 数据检查
-& $py experiments_dtrm/train_seed_family_disentangle.py --config experiments_dtrm/configs/seed_family/seed.json --check-data
+& $py train_seed_family_disentangle.py --config configs/seed_family/seed.json --check-data
 
-# 1) 先跑 P0（必须最先，P3 要用它当冻结教师）
-& $py experiments_dtrm/train_seed_family_disentangle.py --config experiments_dtrm/configs/seed_family/seed.json --variant P0
+# 1) 先跑 P0（必须最先：P3 的冻结教师 = 同 fold 的 P0 源侧 checkpoint）
+& $py train_seed_family_disentangle.py --config configs/seed_family/seed.json --variant P0
 
-# 2) 再跑 P1（表示层对照）和 P3（主候选，--teacher 指向该数据集 P0 的某个 target run 目录）
-& $py experiments_dtrm/train_seed_family_disentangle.py --config experiments_dtrm/configs/seed_family/seed.json --variant P1
-& $py experiments_dtrm/train_seed_family_disentangle.py --config experiments_dtrm/configs/seed_family/seed.json --variant P3 --teacher <P0输出目录/seediv/P0/<hash>/targetXX>
+# 2) 再跑 P1（表示层对照）和 P3（主候选；教师自动按同 session/seed/target 定位 P0 的 source_best.pt）
+& $py train_seed_family_disentangle.py --config configs/seed_family/seed.json --variant P1
+& $py train_seed_family_disentangle.py --config configs/seed_family/seed.json --variant P3
 ```
 
 - 短检查：`--sessions 1 --seeds 42 --targets 1 --epochs 12 --steps 1`（只验链路，不是收敛结果）。
 - 正式：默认 3 sessions × 3 seeds × 全部 target。
-- **P3 的 `--teacher` 必须来自同数据集、同归一化、同划分的 P0 训练**，不能用旧 checkpoint。
+- **P3 教师是 per-fold 的 `source_best.pt`（源侧选模，不是 target-best）**：必须在同 output_root 下先跑完 P0；P3 会自动按 (dataset, session, seed, target, epochs, steps) 匹配，不匹配直接报错，不会静默复用错误教师。
 
 ## 6. 需要实验拿到的结果（交付清单）
 

@@ -13,7 +13,10 @@ from sklearn.metrics import f1_score, confusion_matrix, recall_score
 from seed_family_data import load_records, make_fold
 from conditional_disentangler import ConditionalDisentangler
 
-PROJECT = Path(__file__).resolve().parents[1]
+_HERE = Path(__file__).resolve().parent
+# Source layout puts this file under experiments_dtrm/; the standalone repo puts it at
+# the repo root. PROJECT must be the directory that config-relative paths are based on.
+PROJECT = _HERE.parent if _HERE.name == 'experiments_dtrm' else _HERE
 
 
 def resolve(value):
@@ -156,18 +159,33 @@ def evaluate(model, metric, disent, parts, centroid, cfg, device):
                 confusion_matrix=confusion_matrix(truth, prediction, labels=list(range(k))).tolist(), n_samples=len(truth))
 
 
-def _load_teacher(cfg, args, n_sources, prototypes, device, needed):
-    """Frozen P0 teacher (same split/normalization/branch/fusion) for P3 L_keep."""
-    if not needed:
-        return None
-    if not args.teacher:
-        raise ValueError('P3 requires --teacher <P0 run dir>')
-    root = Path(args.teacher)
-    ckpt = root / 'target_best.pt'
+def _teacher_manifest(cfg, sessions, target, seed, args):
+    """Directory of the per-fold, source-dev-selected P0' run (teacher source)."""
+    p0 = {**cfg, 'variant': 'P0'}
+    effective = dict(config=p0, sessions=sessions, target=target, seed=seed,
+                     epochs=args.epochs or cfg['train']['epochs'],
+                     steps=args.steps or cfg['train']['steps_per_epoch'])
+    digest = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()[:16]
+    return resolve(cfg['output_root']) / cfg['data']['dataset'] / 'P0' / digest / f'target{target:02d}'
+
+
+def _load_teacher(cfg, sessions, target, seed, args, n_sources, prototypes, device, sources):
+    """Per-fold frozen P0' teacher, selected by SOURCE-DEV (never target-best)."""
+    base = _teacher_manifest(cfg, sessions, target, seed, args)
+    ckpt = base / 'source_best.pt'
     if not ckpt.exists():
-        ckpt = root / 'last.pt'
-    if not ckpt.exists():
-        raise FileNotFoundError(f'{root}: no target_best.pt/last.pt')
+        raise FileNotFoundError(
+            f'{ckpt}: train P0 for this exact fold first '
+            f'(source_best.pt is the only valid teacher; target_best.pt is not).')
+    manifest = json.loads((base / 'run.json').read_text(encoding='utf-8'))
+    if manifest.get('target') != target:
+        raise ValueError(f'teacher target mismatch: {manifest.get("target")} vs {target}')
+    if manifest.get('source_ids') != list(sources):
+        raise ValueError('teacher source-subject order mismatch')
+    if manifest.get('sessions') != list(sessions):
+        raise ValueError(f'teacher session mismatch: {manifest.get("sessions")} vs {list(sessions)}')
+    if (manifest.get('audit') or {}).get('normalization') != cfg['data']['normalization']:
+        raise ValueError('teacher normalization mismatch')
     t_model, t_metric, t_disent = build_models(cfg, n_sources, prototypes, device)
     st = torch.load(ckpt, map_location=device, weights_only=False)
     t_model.load_state_dict(st['model']); t_metric.load_state_dict(st['metric'])
@@ -202,9 +220,11 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
         checkpoint_selection='target-best accuracy (transductive)', target_used_for_training=False,
         target_used_for_checkpoint_selection=True), ensure_ascii=False, indent=2), encoding='utf-8')
     model, metric, disent = build_models(cfg, len(sources), prototypes, device)
-    teacher = _load_teacher(cfg, args, len(sources), prototypes, device, cfg['variant'] == 'P3')
+    teacher = (_load_teacher(cfg, sessions, target, seed, args, len(sources), prototypes, device, sources)
+               if cfg['variant'] == 'P3' else None)
     A = contrast_matrix(len(cfg['data']['class_names']), device)
-    t = cfg['train']; aux_modules = [disent.identity, disent.specific, disent.specific_id]
+    t = cfg['train']
+    aux_modules = [disent.identity, disent.specific, disent.specific_id, disent.t_identity]
     auxiliary = [p for module in aux_modules for p in module.parameters()]
     task_opt = torch.optim.Adam([
         {'params': model.cast_encoder.parameters(), 'lr': t['lr'] * t['backbone_lr_multiplier']},
@@ -214,7 +234,7 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
     rng = np.random.default_rng(seed)
     cells = {(r, c): np.flatnonzero(parts['train'][r][1] == c) for r in sources
              for c in range(len(cfg['data']['class_names']))}
-    best, history = -1., []
+    best, best_dev, history = -1., -1., []
     warm = t['warmup_epochs']; variant = cfg['variant']
     for epoch in range(1, effective['epochs'] + 1):
         model.train(); metric.train(); disent.train()
@@ -277,6 +297,8 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
                      task_optimizer=task_opt.state_dict(), auxiliary_optimizer=aux_opt.state_dict(), effective=effective)
         if tgt['accuracy'] > best:
             best = tgt['accuracy']; torch.save(state, out / 'target_best.pt')
+        if dev['subject_mean_accuracy'] > best_dev:
+            best_dev = dev['subject_mean_accuracy']; torch.save(state, out / 'source_best.pt')
         torch.save(state, out / 'last.pt')
         (out / 'history.json').write_text(json.dumps(history, indent=2), encoding='utf-8')
         print(f'{cfg["data"]["dataset"]} {variant} target={target} epoch={epoch} '
@@ -298,7 +320,6 @@ def main():
     parser.add_argument('--sessions', type=int, nargs='+', help='Override with one pooled session group')
     parser.add_argument('--seeds', type=int, nargs='+')
     parser.add_argument('--normalization', choices=['source_global_zscore', 'subject_zscore', 'record_minmax', 'none'])
-    parser.add_argument('--teacher', help='P0 run dir for P3 L_keep (target_best.pt/last.pt)')
     parser.add_argument('--cache-root')
     parser.add_argument('--output-root')
     parser.add_argument('--device', default='cuda')
