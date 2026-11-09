@@ -107,23 +107,25 @@ $py = 'C:/Users/oc200/anaconda3/envs/sgda_py311/python.exe'
 
 ## 9. 代码清单
 
-- `experiments_dtrm/train_seed_family_disentangle.py` — P0/P1/P2/P3 训练入口
-- `experiments_dtrm/conditional_disentangler.py` — 条件解耦模块（s 对抗 + t 对抗 + 类内去相关）
-- `experiments_dtrm/seed_family_data.py` — trial-safe DE 缓存接口 + 归一化
-- `experiments_dtrm/configs/seed_family/{seed,seediv,seedv,seedvii}.json` — 四套配置
+- `train_seed_family_disentangle.py` — P0/P1/P2/P3 训练入口
+- `conditional_disentangler.py` — 条件解耦模块（s 对抗 + t 对抗 + 类内去相关）
+- `seed_family_data.py` — trial-safe DE 缓存接口 + 归一化
+- `models/geosem_stda.py`、`models/context_affective_metric.py` — **内置模型实现**（版本锁定，见 §10）
+- `configs/seed_family/{seed,seediv,seedv,seedvii}.json` — 四套配置
 - `scripts/import_seed_family_de.py` — MAT → NPZ 导入器
 
 ## 10. 环境依赖（必须核对）
 
-本仓库只含**实验代码与配置**，依赖外部项目/数据：
+本仓库含**完整模型实现**（`models/` 已内置），只依赖外部**数据**与**CLIP 权重**：
 
 | 依赖 | 配置字段 | 默认相对路径 | 说明 |
 |---|---|---|---|
-| SGDA 模型代码 | `sgda_root` | `../SGDA_py3.11` | 提供 `GeoSemSTDA` / `MultiSourceAffectiveMetric` 等 |
+| **模型实现（内置）** | `models/` | 仓库内 | `geosem_stda.py`（SHA256 `9CB2C658...`）+ `context_affective_metric.py`（SHA256 `AF909A0C...`），**已锁定版本、无需外部 SGDA** |
+| SGDA（源布局回退） | `sgda_root` | `../SGDA_py3.11` | **仅当仓库内无 `models/` 时**使用（源项目布局） |
 | SEED 系列数据缓存 | `data.cache_root` | `../SGDA_py3.11/data/...` | NPZ: x/y/trial/window |
 | 本地 CLIP 文本模型 | `clip_root` | `../local_clip_model` | 离线生成类别原型 |
 | Python 环境 | — | `sgda_py311` | torch 2.7 + transformers + sklearn |
 
-仓库应放在与 `SGDA_py3.11`、`local_clip_model` 同级的位置（路径才与默认配置一致），否则用 `--cache-root` 或改配置。
+路径可用 `--cache-root`、`--clip-root`、`--sgda-root` 覆盖，仓库不必与 `SGDA_py3.11`/`local_clip_model` 同级。
 
 > 本地运行示例：`python train_seed_family_disentangle.py --config configs/seed_family/seediv.json --check-data`

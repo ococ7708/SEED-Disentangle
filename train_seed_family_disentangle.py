@@ -64,7 +64,13 @@ def prototype_vectors(cfg, device):
 
 
 def build_models(cfg, sources, prototypes, device):
-    sys.path.insert(0, cfg['sgda_root'])
+    local_models = PROJECT / 'models'
+    if (local_models / 'geosem_stda.py').exists():
+        # Standalone repo: model implementation is vendored under ./models (version-pinned).
+        sys.path.insert(0, str(PROJECT))
+    else:
+        # Source layout: reuse the external SGDA project.
+        sys.path.insert(0, cfg['sgda_root'])
     from models.geosem_stda import GeoSemSTDA
     from models.context_affective_metric import MultiSourceAffectiveMetric
     m = cfg['model']; k = len(cfg['data']['class_names'])
@@ -210,11 +216,13 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
     out.mkdir(parents=True, exist_ok=True)
     if (out / 'run.json').exists():
         raise FileExistsError(f'{out}: existing run; choose another output_root rather than overwrite')
+    model_root = (PROJECT / 'models') if (PROJECT / 'models' / 'geosem_stda.py').exists() \
+        else (Path(cfg['sgda_root']) / 'models')
     fingerprints = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in
                     [Path(__file__), Path(__file__).with_name('conditional_disentangler.py'),
                      Path(__file__).with_name('seed_family_data.py'),
-                     Path(cfg['sgda_root']) / 'models/geosem_stda.py',
-                     Path(cfg['sgda_root']) / 'models/context_affective_metric.py']}
+                     model_root / 'geosem_stda.py',
+                     model_root / 'context_affective_metric.py']}
     (out / 'run.json').write_text(json.dumps(dict(**effective, source_ids=sources, audit=audit,
         code_sha256=fingerprints, data_files=[d['path'] for d in records.values()],
         checkpoint_selection='target-best accuracy (transductive)', target_used_for_training=False,
@@ -321,6 +329,8 @@ def main():
     parser.add_argument('--seeds', type=int, nargs='+')
     parser.add_argument('--normalization', choices=['source_global_zscore', 'subject_zscore', 'record_minmax', 'none'])
     parser.add_argument('--cache-root')
+    parser.add_argument('--clip-root', help='override clip_root (local CLIP text model dir)')
+    parser.add_argument('--sgda-root', help='override sgda_root (external model code fallback)')
     parser.add_argument('--output-root')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--check-data', action='store_true')
@@ -338,6 +348,10 @@ def main():
         cfg['data']['normalization'] = args.normalization
     if args.cache_root:
         cfg['data']['cache_root'] = str(resolve(args.cache_root))
+    if args.clip_root:
+        cfg['clip_root'] = str(resolve(args.clip_root))
+    if args.sgda_root:
+        cfg['sgda_root'] = str(resolve(args.sgda_root))
     if args.output_root:
         cfg['output_root'] = str(resolve(args.output_root))
     if (args.epochs is not None and args.epochs < 1) or (args.steps is not None and args.steps < 1):
