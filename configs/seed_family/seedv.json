@@ -1,0 +1,20 @@
+﻿{
+  "variant": "P1",
+  "sgda_root": "../SGDA_py3.11",
+  "clip_root": "../local_clip_model",
+  "output_root": "experiments_dtrm/results/seed_family_disentangle",
+  "data": {
+    "dataset": "seedv",
+    "cache_root": "../SGDA_py3.11/data/seedv_fiveclass/seedv",
+    "class_names": ["disgust", "fear", "sad", "neutral", "happy"],
+    "session_groups": [[1], [2], [3]],
+    "normalization": "record_minmax",
+    "stride": 1
+  },
+  "model": {"sample_length": 3, "dropout": 0.3, "head": "E2", "rank": 2, "fusion_tau": 0.07},
+  "train": {"epochs": 200, "steps_per_epoch": 30, "samples_per_class": 2,
+    "lr": 0.001, "backbone_lr_multiplier": 0.1, "weight_decay": 0.0001,
+    "warmup_epochs": 10, "ramp_epochs": 20, "lambda_adv": 0.01, "lambda_dec": 0.001,
+    "seeds": [42, 43, 44]}
+}
+
