@@ -238,6 +238,8 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
         {'params': model.cast_encoder.parameters(), 'lr': t['lr'] * t['backbone_lr_multiplier']},
         {'params': model.adapters.parameters()}, {'params': model.prototype_head.parameters()},
         {'params': metric.parameters()}, {'params': disent.shared.parameters()}], lr=t['lr'], weight_decay=t['weight_decay'])
+    # Eq. 21 representation params: the adversary is routed through encoder + S only.
+    repr_params = list(model.cast_encoder.parameters()) + list(disent.shared.parameters())
     aux_opt = torch.optim.Adam(auxiliary, lr=t['lr'], weight_decay=t['weight_decay'])
     rng = np.random.default_rng(seed)
     cells = {(r, c): np.flatnonzero(parts['train'][r][1] == c) for r in sources
@@ -271,17 +273,22 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
                         teacher_fused.append(fused_logits(t_model, t_metric, t_disent, s_t, t_centroid, cfg))
                 ss.append(s); qq.append(q); yy.append(y); rr.append(torch.full_like(y, j))
             s, q, y, r = map(torch.cat, (ss, qq, yy, rr))
-            # Separate discriminator fitting; q cannot update CAST, since its input is detached.
+            # The full fused decision is needed by both the discriminator fitting and the adversary.
+            fused_s = fused_logits(model, metric, disent, s, centroid, cfg) if variant == 'P3' else None
+            t_rel = (fused_s @ A) if variant == 'P3' else None
+            # Separate discriminator fitting: s, q AND t heads are fitted by normal CE. The t head
+            # must actually learn, otherwise the adversary faces a random classifier.
             if active:
                 aux_opt.zero_grad(set_to_none=True)
                 aux_loss = disent.identity_loss(s.detach(), y, r) + F.cross_entropy(disent.specific_id(q), r)
+                if t_rel is not None:
+                    aux_loss = aux_loss + disent.t_identity_loss(t_rel.detach(), y, r)
                 aux_loss.backward(); aux_opt.step()
             for p in auxiliary:
                 p.requires_grad_(False)
             task = torch.stack(tasks).mean() + torch.stack(fusions).mean()
             if variant == 'P3':
-                fused_s = fused_logits(model, metric, disent, s, centroid, cfg)
-                adv = disent.t_identity_loss(fused_s @ A, y, r, strength) if active else task.new_zeros(())
+                adv = disent.t_identity_loss(t_rel, y, r, strength) if active else task.new_zeros(())
                 if teacher is not None and active:
                     p0 = F.softmax(torch.cat(teacher_fused), dim=-1).detach()
                     keep = F.kl_div(F.log_softmax(fused_s, dim=-1), p0, reduction='batchmean')
@@ -291,8 +298,19 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
                 adv = disent.identity_loss(s, y, r, strength) if active else task.new_zeros(())
                 keep = task.new_zeros(())
             dec = disent.decorrelation(s, q.detach(), y) if active and variant == 'P2' else task.new_zeros(())
-            loss = task + t['lambda_adv'] * adv + t['lambda_dec'] * dec + t.get('lambda_keep', 1.0) * keep
-            task_opt.zero_grad(set_to_none=True); loss.backward(); task_opt.step()
+            loss = task + t['lambda_dec'] * dec + t.get('lambda_keep', 1.0) * keep
+            task_opt.zero_grad(set_to_none=True)
+            loss.backward(retain_graph=True)
+            if active:
+                # Eq. 21: the adversary updates representation params (encoder + S) only; it never
+                # touches adapters / projection / C1 / fusion, so a gain cannot come from just
+                # re-fitting the downstream head.
+                adv_grads = torch.autograd.grad(t['lambda_adv'] * adv, repr_params,
+                                                retain_graph=False, allow_unused=True)
+                for p, g in zip(repr_params, adv_grads):
+                    if g is not None:
+                        p.grad = (p.grad + g) if p.grad is not None else g.clone()
+            task_opt.step()
             for p in auxiliary:
                 p.requires_grad_(True)
             sums.append([task.item(), adv.item(), dec.item(), keep.item()])

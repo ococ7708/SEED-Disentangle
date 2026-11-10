@@ -75,10 +75,12 @@ def main():
                 assert np.shape(result['confusion_matrix']) == (k, k)
                 assert result['n_samples'] == k * 2 * 3
                 history = json.loads(path.with_name('history.json').read_text())
-                if 'P1' in path.parts or 'P2' in path.parts:
+                if any(v in path.parts for v in ('P1', 'P2', 'P3')):
                     assert history[0]['train_losses'][1] > 0, 'adversarial path was not exercised'
                 if 'P2' in path.parts:
                     assert history[0]['train_losses'][2] > 0, 'decorrelation path was not exercised'
+                if 'P3' in path.parts:
+                    assert history[0]['train_losses'][3] > 0, 'L_keep path was not exercised'
             checks.append(dict(classes=k, synthetic_training_variants=['P0', 'P1', 'P2'],
                                trial_disjoint=True, target_stats_isolated=True, dynamic_metrics=True))
     out = CODE_ROOT / 'results/seed_family_disentangle/verify'
