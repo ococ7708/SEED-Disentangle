@@ -192,7 +192,9 @@ def _teacher_manifest(cfg, sessions, target, seed, args):
     p0 = {**cfg, 'variant': 'P0'}
     effective = dict(config=p0, sessions=sessions, target=target, seed=seed,
                      epochs=args.epochs or cfg['train']['epochs'],
-                     steps=args.steps or cfg['train']['steps_per_epoch'])
+                     steps=args.steps or cfg['train']['steps_per_epoch'],
+                     keep_only=False,
+                     pipeline=getattr(args, 'pipeline', 'new'))
     digest = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()[:16]
     return resolve(cfg['output_root']) / cfg['data']['dataset'] / 'P0' / digest / f'target{target:02d}'
 
@@ -200,11 +202,12 @@ def _teacher_manifest(cfg, sessions, target, seed, args):
 def _load_teacher(cfg, sessions, target, seed, args, n_sources, prototypes, device, sources):
     """Per-fold frozen P0' teacher, selected by SOURCE-DEV (never target-best)."""
     base = _teacher_manifest(cfg, sessions, target, seed, args)
-    ckpt = base / 'source_best.pt'
+    name = 'last.pt' if getattr(args, 'pipeline', 'new') == 'old' else 'source_best.pt'
+    ckpt = base / name
     if not ckpt.exists():
         raise FileNotFoundError(
             f'{ckpt}: train P0 for this exact fold first '
-            f'(source_best.pt is the only valid teacher; target_best.pt is not).')
+            f'({name} is the valid teacher; target_best.pt is not).')
     manifest = json.loads((base / 'run.json').read_text(encoding='utf-8'))
     if manifest.get('target') != target:
         raise ValueError(f'teacher target mismatch: {manifest.get("target")} vs {target}')
@@ -224,15 +227,49 @@ def _load_teacher(cfg, sessions, target, seed, args, n_sources, prototypes, devi
     return t_model, t_metric, t_disent, st['centroids'].to(device)
 
 
+def make_fold_old(target, sample_length=3, seed=42):
+    """OLD pipeline (all-source get_data): no held-out source trial.
+
+    This matches the mainstream EEG DG protocol: train on every source subject's
+    full data, evaluate the target. The source-side out-of-distribution feedback
+    is supplied by a SEPARATE group-out (OOF) run, not by trial hold-out here.
+    """
+    from four_cell_probe import _load_session1
+    data, labels, _, _, _ = _load_session1(sample_length, seed)
+    n = len(data)
+    parts = {'train': {}, 'dev': {}, 'target': {}}
+    sources = []
+    for i in range(n):
+        x = np.stack([np.asarray(w) for w in data[i]]).astype(np.float32)
+        y = np.asarray(labels[i]).reshape(-1)
+        sid = i + 1
+        if sid == target:
+            parts['target'][sid] = (x, y)
+        else:
+            parts['train'][sid] = (x, y)
+            sources.append(sid)
+    # No held-out source trial: dev mirrors train so the loop's dev evaluation works;
+    # the teacher for the OLD pipeline is the P0 final epoch (last.pt), not source_best.
+    parts['dev'] = {sid: (x, y) for sid, (x, y) in parts['train'].items()}
+    return parts, sources, {'normalization': 'record_minmax'}
+
+
 def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    parts, sources, audit = make_fold(cfg, records, target)
+    pipeline = getattr(args, 'pipeline', 'new')
+    if pipeline == 'old':
+        parts, sources, audit = make_fold_old(target)
+    else:
+        parts, sources, audit = make_fold(cfg, records, target)
     effective = dict(config=cfg, sessions=sessions, target=target, seed=seed,
-                     epochs=args.epochs or cfg['train']['epochs'], steps=args.steps or cfg['train']['steps_per_epoch'])
+                     epochs=args.epochs or cfg['train']['epochs'],
+                     steps=args.steps or cfg['train']['steps_per_epoch'],
+                     keep_only=bool(getattr(args, 'keep_only', False)),
+                     pipeline=pipeline)
     digest = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()[:16]
     out = resolve(cfg['output_root']) / cfg['data']['dataset'] / cfg['variant'] / digest / f'target{target:02d}'
     out.mkdir(parents=True, exist_ok=True)
@@ -250,8 +287,10 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
         checkpoint_selection='target-best accuracy (transductive)', target_used_for_training=False,
         target_used_for_checkpoint_selection=True), ensure_ascii=False, indent=2), encoding='utf-8')
     model, metric, disent = build_models(cfg, len(sources), prototypes, device)
+    use_keep = (cfg['variant'] == 'P3') or getattr(args, 'keep_only', False)
+    use_adv = (cfg['variant'] in ('P1', 'P2', 'P3')) and not getattr(args, 'keep_only', False)
     teacher = (_load_teacher(cfg, sessions, target, seed, args, len(sources), prototypes, device, sources)
-               if cfg['variant'] == 'P3' else None)
+               if use_keep else None)
     A = contrast_matrix(len(cfg['data']['class_names']), device)
     t = cfg['train']
     aux_modules = [disent.identity, disent.specific, disent.specific_id, disent.t_identity]
@@ -295,9 +334,9 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
                         teacher_fused.append(fused_logits(t_model, t_metric, t_disent, s_t, t_centroid, cfg))
                 ss.append(s); qq.append(q); yy.append(y); rr.append(torch.full_like(y, j))
             s, q, y, r = map(torch.cat, (ss, qq, yy, rr))
-            # The full fused decision is needed by both the discriminator fitting and the adversary.
-            fused_s = fused_logits(model, metric, disent, s, centroid, cfg) if variant == 'P3' else None
-            t_rel = (fused_s @ A) if variant == 'P3' else None
+            # The fused decision is needed for the ranking keep (B/C) and the t adversary (C).
+            fused_s = fused_logits(model, metric, disent, s, centroid, cfg) if use_keep else None
+            t_rel = (fused_s @ A) if (variant == 'P3' and use_adv) else None
             # Separate discriminator fitting: s, q AND t heads are fitted by normal CE. The t head
             # must actually learn, otherwise the adversary faces a random classifier.
             if active:
@@ -309,19 +348,20 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
             for p in auxiliary:
                 p.requires_grad_(False)
             task = torch.stack(tasks).mean() + torch.stack(fusions).mean()
-            if variant == 'P3':
+            if variant == 'P3' and use_adv:
                 adv = disent.t_identity_loss(t_rel, y, r, strength) if active else task.new_zeros(())
-                if teacher is not None and active:
-                    teacher_logits = torch.cat(teacher_fused).detach()
-                    if t.get('keep_mode', 'rank') == 'kl':
-                        keep = F.kl_div(F.log_softmax(fused_s, dim=-1),
-                                        F.softmax(teacher_logits, dim=-1), reduction='batchmean')
-                    else:
-                        keep = ranking_keep(fused_s, teacher_logits, y, float(t.get('gamma_max', 1.0)))
-                else:
-                    keep = task.new_zeros(())
-            else:
+            elif variant in ('P1', 'P2') and use_adv:
                 adv = disent.identity_loss(s, y, r, strength) if active else task.new_zeros(())
+            else:
+                adv = task.new_zeros(())
+            if use_keep and teacher is not None and active:
+                teacher_logits = torch.cat(teacher_fused).detach()
+                if t.get('keep_mode', 'rank') == 'kl':
+                    keep = F.kl_div(F.log_softmax(fused_s, dim=-1),
+                                    F.softmax(teacher_logits, dim=-1), reduction='batchmean')
+                else:
+                    keep = ranking_keep(fused_s, teacher_logits, y, float(t.get('gamma_max', 1.0)))
+            else:
                 keep = task.new_zeros(())
             dec = disent.decorrelation(s, q.detach(), y) if active and variant == 'P2' else task.new_zeros(())
             loss = task + t['lambda_dec'] * dec + t.get('lambda_keep', 1.0) * keep
@@ -368,6 +408,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
     parser.add_argument('--variant', choices=['P0', 'P1', 'P2', 'P3'])
+    parser.add_argument('--keep-only', action='store_true',
+                        help='P0 + teacher ranking keep, adversarial OFF (group B)')
+    parser.add_argument('--pipeline', choices=['new', 'old'], default='new',
+                        help='new = seed_family trial-dev; old = all-source get_data (mainstream, for the main table)')
     parser.add_argument('--targets', type=int, nargs='+')
     parser.add_argument('--sessions', type=int, nargs='+', help='Override with one pooled session group')
     parser.add_argument('--seeds', type=int, nargs='+')
