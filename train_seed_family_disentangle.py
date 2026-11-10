@@ -125,6 +125,28 @@ def fused_logits(model, metric, disent, s, centroid, cfg):
     return metric.fused_output(s, zs, weights).logits
 
 
+def ranking_keep(student_logits, teacher_logits, y, gamma_max=1.0):
+    """Selective task preservation (Eq. 4 of the 20261110 theory doc).
+
+    Only samples the teacher classifies correctly are protected, and only up to the
+    teacher's (capped) correct-class margin. Unlike full KL this neither copies the
+    teacher's confidence nor blocks task-invariant changes to the relative logits.
+    """
+    k = student_logits.shape[1]
+    teacher_pred = teacher_logits.argmax(-1)
+    correct = (teacher_pred == y).to(student_logits.dtype)
+    t_y = teacher_logits.gather(1, y.unsqueeze(1))
+    t_margin = t_y - teacher_logits
+    gamma = torch.minimum(torch.full_like(t_margin, float(gamma_max)), t_margin)
+    s_y = student_logits.gather(1, y.unsqueeze(1))
+    s_margin = s_y - student_logits
+    hinge = F.relu(gamma - s_margin).pow(2)
+    mask = torch.ones_like(hinge)
+    mask.scatter_(1, y.unsqueeze(1), 0.0)
+    per_sample = (hinge * mask).sum(1) / (k - 1)
+    return (per_sample * correct).mean()
+
+
 
 @torch.no_grad()
 def centers(model, disent, parts, sources, device):
@@ -290,8 +312,12 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
             if variant == 'P3':
                 adv = disent.t_identity_loss(t_rel, y, r, strength) if active else task.new_zeros(())
                 if teacher is not None and active:
-                    p0 = F.softmax(torch.cat(teacher_fused), dim=-1).detach()
-                    keep = F.kl_div(F.log_softmax(fused_s, dim=-1), p0, reduction='batchmean')
+                    teacher_logits = torch.cat(teacher_fused).detach()
+                    if t.get('keep_mode', 'rank') == 'kl':
+                        keep = F.kl_div(F.log_softmax(fused_s, dim=-1),
+                                        F.softmax(teacher_logits, dim=-1), reduction='batchmean')
+                    else:
+                        keep = ranking_keep(fused_s, teacher_logits, y, float(t.get('gamma_max', 1.0)))
                 else:
                     keep = task.new_zeros(())
             else:
@@ -345,6 +371,9 @@ def main():
     parser.add_argument('--targets', type=int, nargs='+')
     parser.add_argument('--sessions', type=int, nargs='+', help='Override with one pooled session group')
     parser.add_argument('--seeds', type=int, nargs='+')
+    parser.add_argument('--lambda-adv', type=float, help='override lambda_adv (sweep candidates incl. 0 for source-held-out selection)')
+    parser.add_argument('--keep-mode', choices=['kl', 'rank'], help='L_keep: full KL vs selective ranking protection')
+    parser.add_argument('--gamma-max', type=float, help='cap for the teacher margin in ranking protection')
     parser.add_argument('--normalization', choices=['source_global_zscore', 'subject_zscore', 'record_minmax', 'none'])
     parser.add_argument('--cache-root')
     parser.add_argument('--clip-root', help='override clip_root (local CLIP text model dir)')
@@ -358,6 +387,12 @@ def main():
     cfg = read_config(args.config)
     if args.variant:
         cfg['variant'] = args.variant
+    if args.lambda_adv is not None:
+        cfg['train']['lambda_adv'] = args.lambda_adv
+    if args.keep_mode:
+        cfg['train']['keep_mode'] = args.keep_mode
+    if args.gamma_max is not None:
+        cfg['train']['gamma_max'] = args.gamma_max
     if args.sessions:
         cfg['data']['session_groups'] = [args.sessions]
     if args.seeds:
