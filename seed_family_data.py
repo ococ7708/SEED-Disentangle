@@ -38,10 +38,11 @@ def load_records(config, sessions):
     return records, subjects
 
 
-def make_fold(config, records, target):
+def make_fold(config, records, target, no_dev=False):
     """Source validation: one whole trial/class/subject, across selected sessions.
 
     A subject remains a single source domain when multiple sessions are pooled.
+    With no_dev=True, every trial stays in train (all-source, mainstream protocol).
     """
     length = config['model']['sample_length']
     classes = len(config['data']['class_names'])
@@ -53,10 +54,13 @@ def make_fold(config, records, target):
         for c in range(classes):
             trials = sorted((s, r, int(t)) for (s, rr), d in records.items() if rr == r
                             for t in np.unique(d['trial'][d['y'] == c]))
-            if len(trials) < 2:
-                raise ValueError(f'subject {r} class {c}: need >=2 trials for source validation')
-            dev_keys.add(trials[-1])
-            train_keys.update(trials[:-1])
+            if no_dev:
+                train_keys.update(trials)
+            else:
+                if len(trials) < 2:
+                    raise ValueError(f'subject {r} class {c}: need >=2 trials for source validation')
+                dev_keys.add(trials[-1])
+                train_keys.update(trials[:-1])
     mode = config['data']['normalization']
     if mode == 'source_global_zscore':
         values = np.concatenate([d['x'][np.isin(d['trial'], [t for ss, rr, t in train_keys if (ss, rr) == (s, r)])]
@@ -92,4 +96,8 @@ def make_fold(config, records, target):
             part[r] = (np.stack(xs).astype(np.float32), np.array(ys, dtype=np.int64))
             if set(ys) != set(range(classes)):
                 raise ValueError(f'{name}/{r}: missing classes after windowing')
+    if no_dev:
+        # All-source protocol: dev mirrors train (log-only). The teacher uses last.pt,
+        # not source_best, so this dev set does not leak into the teacher.
+        partitions['dev'] = {r: (x.copy(), y.copy()) for r, (x, y) in partitions['train'].items()}
     return partitions, subjects, audit

@@ -194,7 +194,7 @@ def _teacher_manifest(cfg, sessions, target, seed, args):
                      epochs=args.epochs or cfg['train']['epochs'],
                      steps=args.steps or cfg['train']['steps_per_epoch'],
                      keep_only=False,
-                     pipeline=getattr(args, 'pipeline', 'new'))
+                     all_source=getattr(args, 'all_source', False))
     digest = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()[:16]
     return resolve(cfg['output_root']) / cfg['data']['dataset'] / 'P0' / digest / f'target{target:02d}'
 
@@ -202,7 +202,7 @@ def _teacher_manifest(cfg, sessions, target, seed, args):
 def _load_teacher(cfg, sessions, target, seed, args, n_sources, prototypes, device, sources):
     """Per-fold frozen P0' teacher, selected by SOURCE-DEV (never target-best)."""
     base = _teacher_manifest(cfg, sessions, target, seed, args)
-    name = 'last.pt' if getattr(args, 'pipeline', 'new') == 'old' else 'source_best.pt'
+    name = 'last.pt' if getattr(args, 'all_source', False) else 'source_best.pt'
     ckpt = base / name
     if not ckpt.exists():
         raise FileNotFoundError(
@@ -260,16 +260,13 @@ def run_fold(cfg, sessions, target, seed, device, prototypes, records, args):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    pipeline = getattr(args, 'pipeline', 'new')
-    if pipeline == 'old':
-        parts, sources, audit = make_fold_old(target)
-    else:
-        parts, sources, audit = make_fold(cfg, records, target)
+    all_source = getattr(args, 'all_source', False)
+    parts, sources, audit = make_fold(cfg, records, target, no_dev=all_source)
     effective = dict(config=cfg, sessions=sessions, target=target, seed=seed,
                      epochs=args.epochs or cfg['train']['epochs'],
                      steps=args.steps or cfg['train']['steps_per_epoch'],
                      keep_only=bool(getattr(args, 'keep_only', False)),
-                     pipeline=pipeline)
+                     all_source=all_source)
     digest = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()[:16]
     out = resolve(cfg['output_root']) / cfg['data']['dataset'] / cfg['variant'] / digest / f'target{target:02d}'
     out.mkdir(parents=True, exist_ok=True)
@@ -410,8 +407,8 @@ def main():
     parser.add_argument('--variant', choices=['P0', 'P1', 'P2', 'P3'])
     parser.add_argument('--keep-only', action='store_true',
                         help='P0 + teacher ranking keep, adversarial OFF (group B)')
-    parser.add_argument('--pipeline', choices=['new', 'old'], default='new',
-                        help='new = seed_family trial-dev; old = all-source get_data (mainstream, for the main table)')
+    parser.add_argument('--all-source', action='store_true',
+                        help='use every source trial in train (mainstream protocol, no held-out dev)')
     parser.add_argument('--targets', type=int, nargs='+')
     parser.add_argument('--sessions', type=int, nargs='+', help='Override with one pooled session group')
     parser.add_argument('--seeds', type=int, nargs='+')
